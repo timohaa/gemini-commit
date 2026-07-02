@@ -1,0 +1,69 @@
+# gemini-commit
+
+Smart `git commit` from the command line, powered by the [Gemini CLI](https://github.com/google-gemini/gemini-cli).
+
+Run `commit` in any git repository and Gemini inspects your working tree, writes commit messages matching your repo's existing style, and commits — splitting large changesets into logical separate commits when appropriate.
+
+## Requirements
+
+- [Gemini CLI](https://github.com/google-gemini/gemini-cli) installed and authenticated (`gemini` must be on your `PATH`)
+- `zsh` (default shell on macOS)
+- `git`
+
+## Installation
+
+Clone the repo and symlink the script somewhere on your `PATH`:
+
+```sh
+git clone https://github.com/timohaa/gemini-commit.git
+ln -s "$(pwd)/gemini-commit/commit" ~/.local/bin/commit
+```
+
+Make sure `~/.local/bin` is on your `PATH`.
+
+## Usage
+
+```
+Usage: commit [options] [custom instructions...]
+
+Options:
+  -n, --no-yolo     Disable YOLO mode (ask for confirmation before executing actions)
+  -p, --push        Automatically push after successful commit(s)
+  -h, --help        Show this help message
+  --                Treat everything after as custom instructions (even if it starts with -)
+```
+
+### Examples
+
+Commit everything, fully automatic:
+
+```sh
+commit
+```
+
+Guide the commit with natural-language instructions:
+
+```sh
+commit "only index.js changes"
+commit "split the refactor and the bugfix into separate commits"
+```
+
+Commit and push:
+
+```sh
+commit -p "fix bug in parser"
+```
+
+Review each action before it runs:
+
+```sh
+commit --no-yolo
+```
+
+## How it works
+
+The script is a thin wrapper: after validating that you're in a git repository with uncommitted changes, it launches `gemini` in interactive mode with a prompt instructing it to commit the changes, follow the repository's existing commit-message style, and optionally push. By default it runs in YOLO mode (`-y`), letting Gemini execute git commands without per-command confirmation; use `--no-yolo` if you want to approve each step.
+
+## License
+
+[MIT](LICENSE)
