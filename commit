@@ -1,17 +1,20 @@
 #!/bin/zsh
 
-# Smart git commit using Gemini AI
+# Smart git commit using the Antigravity CLI
+
+VERSION="2.0.0"
 
 show_help() {
   cat <<'EOF'
 Usage: commit [options] [custom instructions...]
 
-Smart git commit using Gemini AI.
+Smart git commit using the Antigravity CLI.
 
 Options:
   -n, --no-yolo     Disable YOLO mode (ask for confirmation before executing actions)
   -p, --push        Automatically push after successful commit(s)
   -h, --help        Show this help message
+  -v, --version     Show version
   --                Treat everything after as custom instructions (even if it starts with -)
 
 Examples:
@@ -41,6 +44,10 @@ while [[ $# -gt 0 ]]; do
       show_help
       exit 0
       ;;
+    -v|--version)
+      echo "commit $VERSION"
+      exit 0
+      ;;
     --)
       shift
       args+=("$@")
@@ -60,9 +67,9 @@ done
 
 custom_instructions="${args[*]}"
 
-# 2. Check that the gemini CLI is available
-if ! command -v gemini >/dev/null 2>&1; then
-  echo "Error: 'gemini' command not found. Install the Gemini CLI first." >&2
+# 2. Check that the agy CLI is available
+if ! command -v agy >/dev/null 2>&1; then
+  echo "Error: 'agy' command not found. Install the Antigravity CLI first." >&2
   exit 1
 fi
 
@@ -94,9 +101,9 @@ if [[ "$push_after" == "true" ]]; then
 Once the commit is (or commits are) successfully completed, push the committed branches to the remote repository (e.g. using 'git push')."
 fi
 
-# 6. Run Gemini
-gemini_args=()
-[[ "$yolo" == "true" ]] && gemini_args+=(-y)
-gemini_args+=(-i "$base_prompt")
+# 6. Run Antigravity
+agy_args=()
+[[ "$yolo" == "true" ]] && agy_args+=(--dangerously-skip-permissions)
+agy_args+=(-i "$base_prompt")
 
-gemini "${gemini_args[@]}"
+agy "${agy_args[@]}"
