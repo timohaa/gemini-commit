@@ -1,17 +1,33 @@
-#!/bin/zsh
+#!/bin/sh
 
 # Smart git commit using the Antigravity CLI
+#
+# Written in POSIX sh so it runs under sh, bash, zsh, dash, ash and ksh alike.
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 
-QUICK_MODEL="gemini-3.6-flash-low"
-DEEP_MODEL="gemini-3.1-pro-high"
+# --quick and --deep resolve against 'agy models' at runtime rather than naming a
+# model literally, so they keep pointing at something sensible as models come and
+# go. Patterns are tried in order of preference; within one pattern the first
+# match wins, since 'agy models' lists newest first. These fallbacks are only
+# used when 'agy models' cannot be read.
+QUICK_PATTERNS='*flash*-low *-low *flash* *'
+DEEP_PATTERNS='*pro*-high *pro* *-high *'
+QUICK_FALLBACK="gemini-3.6-flash-low"
+DEEP_FALLBACK="gemini-3.1-pro-high"
 
 # Caps on how much repository context is inlined into the prompt
 MAX_SUBJECTS=20
+MAX_FULL_MESSAGES=5      # commits shown in full, bodies included
+MAX_FULL_LOG_LINES=80    # safety valve for repos with very long bodies
 MAX_STATUS_LINES=100
 MAX_DIFFSTAT_LINES=100
 
+# A literal newline, since POSIX sh has no $'\n'
+NL='
+'
+
+# Print the usage/help text to stdout.
 show_help() {
   cat <<'EOF'
 Usage: commit [options] [custom instructions...]
@@ -22,8 +38,8 @@ Options:
   -n, --no-yolo     Disable YOLO mode (ask for confirmation before executing actions)
       --safe        Alias for --no-yolo
   -p, --push        Automatically push after successful commit(s)
-  -q, --quick       Use a fast, low-effort model (gemini-3.6-flash-low)
-  -d, --deep        Use a slower, high-effort model (gemini-3.1-pro-high)
+  -q, --quick       Use the fastest low-effort model listed by 'agy models'
+  -d, --deep        Use the strongest high-effort model listed by 'agy models'
       --model NAME  Use a specific model (see 'agy models')
       --effort STR  Reasoning effort: low, medium or high
       --show-prompt Print the generated prompt and exit without running agy
@@ -41,17 +57,44 @@ Examples:
 EOF
 }
 
-# Print at most <max> lines of <text>, noting how much was cut
+# Print at most <max> lines of <text>, noting how much was cut.
+# Uses cap_-prefixed globals rather than 'local', which is not POSIX.
 cap() {
-  local max=$1 text=$2
-  local -a lines
-  [[ -z "$text" ]] && return 0
-  lines=("${(@f)text}")
-  if (( ${#lines} > max )); then
-    print -rl -- "${(@)lines[1,max]}" "... (${#lines} lines total, truncated)"
+  cap_max=$1
+  cap_text=$2
+  [ -n "$cap_text" ] || return 0
+  cap_n=$(printf '%s\n' "$cap_text" | wc -l)
+  cap_n=$((cap_n)) # some wc implementations pad the count with leading spaces
+  if [ "$cap_n" -gt "$cap_max" ]; then
+    # sed rather than head: head exits early and can make the upstream printf
+    # report a broken pipe when SIGPIPE is inherited as ignored.
+    printf '%s\n' "$cap_text" | sed -n "1,${cap_max}p"
+    printf '... (%s lines total, truncated)\n' "$cap_n"
   else
-    print -r -- "$text"
+    printf '%s\n' "$cap_text"
   fi
+}
+
+# Print the first model in $models matching one of the given glob patterns,
+# trying the patterns left to right. Returns 1 if nothing matched at all.
+# Globbing is off throughout: both the pattern list and the model list are
+# deliberately unquoted (for word splitting, and so 'case' treats the pattern as
+# a glob), and neither should ever expand against files in the current directory.
+pick_model() {
+  set -f
+  pick_result=""
+  for pick_pat in $1; do
+    for pick_line in $models; do
+      case "$pick_line" in
+        $pick_pat) pick_result="$pick_line" ;;
+      esac
+      [ -z "$pick_result" ] || break
+    done
+    [ -z "$pick_result" ] || break
+  done
+  set +f
+  [ -n "$pick_result" ] || return 1
+  printf '%s\n' "$pick_result"
 }
 
 # 1. Parse options and arguments (before any git checks, so --help always works)
@@ -59,10 +102,11 @@ yolo=true
 push_after=false
 show_prompt=false
 model=""
+model_role=""
 effort=""
-args=()
+args=""
 
-while [[ $# -gt 0 ]]; do
+while [ $# -gt 0 ]; do
   case "$1" in
     -n|--no-yolo|--safe)
       yolo=false
@@ -73,44 +117,53 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     -q|--quick)
-      model="$QUICK_MODEL"
+      model=""
+      model_role="quick"
       shift
       ;;
     -d|--deep)
-      model="$DEEP_MODEL"
+      model=""
+      model_role="deep"
       shift
       ;;
     --model)
-      if [[ -z "$2" ]]; then
-        echo "Error: --model requires a model name (see 'agy models')." >&2
+      if [ -z "${2-}" ]; then
+        printf '%s\n' "Error: --model requires a model name (see 'agy models')." >&2
         exit 2
       fi
       model="$2"
+      model_role=""
       shift 2
       ;;
     --model=*)
       model="${1#--model=}"
-      if [[ -z "$model" ]]; then
-        echo "Error: --model requires a model name (see 'agy models')." >&2
+      model_role=""
+      if [ -z "$model" ]; then
+        printf '%s\n' "Error: --model requires a model name (see 'agy models')." >&2
         exit 2
       fi
       shift
       ;;
     --effort|--effort=*)
-      if [[ "$1" == --effort=* ]]; then
-        effort="${1#--effort=}"
-        shift
-      elif [[ -n "$2" ]]; then
-        effort="$2"
-        shift 2
-      else
-        echo "Error: --effort requires a value: low, medium or high" >&2
-        exit 2
-      fi
+      case "$1" in
+        --effort=*)
+          effort="${1#--effort=}"
+          shift
+          ;;
+        *)
+          if [ -n "${2-}" ]; then
+            effort="$2"
+            shift 2
+          else
+            printf '%s\n' "Error: --effort requires a value: low, medium or high" >&2
+            exit 2
+          fi
+          ;;
+      esac
       case "$effort" in
         low|medium|high) ;;
         *)
-          echo "Error: --effort must be one of: low, medium, high" >&2
+          printf '%s\n' "Error: --effort must be one of: low, medium, high" >&2
           exit 2
           ;;
       esac
@@ -124,78 +177,116 @@ while [[ $# -gt 0 ]]; do
       exit 0
       ;;
     -v|--version)
-      echo "commit $VERSION"
+      printf '%s\n' "commit $VERSION"
       exit 0
       ;;
     --)
       shift
-      args+=("$@")
+      for arg in "$@"; do
+        args="${args:+${args} }${arg}"
+      done
       break
       ;;
     -*)
-      echo "Error: Unknown option: $1" >&2
-      echo "Run 'commit --help' for usage." >&2
+      printf '%s\n' "Error: Unknown option: $1" >&2
+      printf '%s\n' "Run 'commit --help' for usage." >&2
       exit 2
       ;;
     *)
-      args+=("$1")
+      # Joined with spaces rather than one-per-line: an unquoted
+      # 'commit split into two commits' must stay a single instruction,
+      # not degenerate into four one-word ones.
+      args="${args:+${args} }${1}"
       shift
       ;;
   esac
 done
 
-# 2. Check that the agy CLI is available
-if ! command -v agy >/dev/null 2>&1; then
-  echo "Error: 'agy' command not found. Install the Antigravity CLI first." >&2
+# 2. Check that the agy CLI is available. --show-prompt never runs agy, so it
+#    stays usable on machines without the CLI; model resolution then simply
+#    falls back to the hardcoded defaults.
+if [ "$show_prompt" != "true" ] && ! command -v agy >/dev/null 2>&1; then
+  printf '%s\n' "Error: 'agy' command not found. Install the Antigravity CLI first." >&2
   exit 1
 fi
 
-# 3. Check if we are inside a git repository
-if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  echo "Error: Not a git repository (or any of the parent directories)" >&2
+# 3. Check if we are inside a git work tree. rev-parse exits 0 and prints
+#    "false" in bare repos and inside .git, so test the output, not the status.
+if [ "$(git rev-parse --is-inside-work-tree 2>/dev/null)" != "true" ]; then
+  printf '%s\n' "Error: Not inside a git work tree" >&2
   exit 1
 fi
 
 # 4. Check if there are any changes to commit (including untracked files)
 git_status="$(git status --porcelain)"
-if [[ -z "$git_status" ]]; then
-  echo "Nothing to commit (working tree clean)"
+if [ -z "$git_status" ]; then
+  printf '%s\n' "Nothing to commit (working tree clean)"
   exit 0
 fi
 
-# 5. Validate the model, if one was requested. A model that 'agy models' does not
-#    list is a warning rather than an error, so presets keep working across renames.
-if [[ -n "$model" ]]; then
-  available="$(agy models 2>/dev/null)"
-  if [[ -n "$available" ]] && ! grep -qx -- "$model" <<<"$available"; then
-    echo "Warning: model '$model' not listed by 'agy models'; using agy's default." >&2
-    model=""
-  fi
+# 5. Resolve the model. --quick/--deep are picked from 'agy models'; an explicit
+#    --model is validated against the same list. A model that is not listed is a
+#    warning rather than an error, so a run never fails just over model naming.
+models=""
+if [ -n "$model" ] || [ -n "$model_role" ]; then
+  models="$(agy models 2>/dev/null)"
+fi
+
+case "$model_role" in
+  quick)
+    model="$(pick_model "$QUICK_PATTERNS")" || model="$QUICK_FALLBACK"
+    ;;
+  deep)
+    model="$(pick_model "$DEEP_PATTERNS")" || model="$DEEP_FALLBACK"
+    ;;
+esac
+
+# NL-padding on both sides makes this an exact per-line match (the glob only hits
+# when $model is a whole line of $models, not a substring of a longer name) without
+# a bash herestring, which is not POSIX.
+if [ -n "$model" ] && [ -n "$models" ]; then
+  case "${NL}${models}${NL}" in
+    *"${NL}${model}${NL}"*) ;;
+    *)
+      printf '%s\n' "Warning: model '$model' not listed by 'agy models'; using agy's default." >&2
+      model=""
+      ;;
+  esac
 fi
 
 # 6. Gather the repository context up front, so the agent does not have to
+#    re-derive it (branch, log, status, diffstat) itself on every run.
 branch="$(git branch --show-current 2>/dev/null)"
-if [[ -z "$branch" ]]; then
+if [ -z "$branch" ]; then
   branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
-  [[ -z "$branch" || "$branch" == "HEAD" ]] && branch="(detached HEAD)"
+  if [ -z "$branch" ] || [ "$branch" = "HEAD" ]; then
+    branch="(detached HEAD)"
+  fi
 fi
 has_head="$(git rev-parse --verify -q HEAD 2>/dev/null)"
 
 context="Branch: ${branch}"
 
-if [[ -n "$has_head" ]]; then
-  context+=$'\n\n'"Recent commit subjects (match this style — mood, capitalization, prefix convention, length):"$'\n'
-  context+="$(cap $MAX_SUBJECTS "$(git log --pretty=%s -n $MAX_SUBJECTS)")"
+if [ -n "$has_head" ]; then
+  # Co-author trailers are stripped rather than shown and disclaimed: left in, they read
+  # as part of the house style and get copied onto commits the co-author had no hand in.
+  # Case-insensitive and anchored, since git treats trailer keys case-insensitively but a
+  # body line merely mentioning the phrase should survive.
+  context="${context}${NL}${NL}Recent commit messages in full, newest first — match this body format, line wrapping and trailer convention:${NL}"
+  context="${context}$(cap "$MAX_FULL_LOG_LINES" "$(git log -n "$MAX_FULL_MESSAGES" --pretty='format:=== %h%n%B' | grep -iv '^[[:space:]]*co-authored-by:')")"
+
+  context="${context}${NL}${NL}Recent commit subjects, a wider sample (the newest few repeat the messages above) — match this subject style: mood, capitalization, prefix convention, length:${NL}"
+  context="${context}$(cap "$MAX_SUBJECTS" "$(git log --pretty=%s -n "$MAX_SUBJECTS")")"
 else
-  context+=$'\n\n'"This repository has no commits yet, so there is no existing style to match."
+  context="${context}${NL}${NL}This repository has no commits yet, so there is no existing style to match."
 fi
 
-context+=$'\n\n'"Changed files (git status --porcelain):"$'\n'
-context+="$(cap $MAX_STATUS_LINES "$git_status")"
+context="${context}${NL}${NL}Changed files (git status --porcelain):${NL}"
+context="${context}$(cap "$MAX_STATUS_LINES" "$git_status")"
 
-if [[ -n "$has_head" ]]; then
-  context+=$'\n\n'"Diffstat vs HEAD (untracked files are not included here):"$'\n'
-  context+="$(cap $MAX_DIFFSTAT_LINES "$(git diff --stat HEAD)")"
+if [ -n "$has_head" ]; then
+  context="${context}${NL}${NL}Diffstat vs HEAD (untracked files are not included here):${NL}"
+  context="${context}$(cap "$MAX_DIFFSTAT_LINES" "$(git diff --stat HEAD)")"
 fi
 
 # 7. Construct the prompt
@@ -220,33 +311,36 @@ ${context}
    first, then what builds on them (a new helper before its callers, a config or ignore change
    before the code that relies on it). The history should read in the order the work would
    naturally have been done, and each commit should be self-consistent on its own.
-4. Write each message in the style of the recent subjects above.
+4. Write each message in the style of the recent messages above: match the subject
+   convention, and the body format where a body is warranted. Follow the structural
+   conventions (bullet style, wrapping width, prefixes) — but do not add a body just
+   because earlier commits have one, and do not carry over a trailer unless it genuinely
+   applies to this commit.
 5. Stage per commit with explicit paths (\`git add <paths>\`) and commit. Do not \`git add -A\`
    once and dump everything into a single commit unless that genuinely is the right grouping.
 EOF
 )
 
-if (( ${#args} > 0 )); then
-  base_prompt+=$'\n\n'"## User instructions for this commit"$'\n'
-  for arg in "${args[@]}"; do
-    base_prompt+="- ${arg}"$'\n'
-  done
+if [ -n "$args" ]; then
+  base_prompt="${base_prompt}${NL}${NL}## User instructions for this commit${NL}${args}"
 fi
 
-if [[ "$push_after" == "true" ]]; then
-  base_prompt+=$'\n\n'"Once the commit is (or commits are) successfully completed, push the committed branches to the remote repository (e.g. using 'git push')."
+if [ "$push_after" = "true" ]; then
+  base_prompt="${base_prompt}${NL}${NL}Once the commit is (or commits are) successfully completed, push the committed branches to the remote repository (e.g. using 'git push')."
 fi
 
-if [[ "$show_prompt" == "true" ]]; then
-  print -r -- "$base_prompt"
+if [ "$show_prompt" = "true" ]; then
+  printf '%s\n' "$base_prompt"
   exit 0
 fi
 
-# 8. Run Antigravity
-agy_args=()
-[[ "$yolo" == "true" ]] && agy_args+=(--dangerously-skip-permissions)
-[[ -n "$model" ]] && agy_args+=(--model "$model")
-[[ -n "$effort" ]] && agy_args+=(--effort "$effort")
-agy_args+=(-i "$base_prompt")
+# 8. Run Antigravity. Rebuild the positional parameters as agy's argument list;
+#    the leading 'set --' is required because '--' above breaks out of the loop
+#    without consuming the remaining arguments.
+set --
+[ "$yolo" = "true" ] && set -- "$@" --dangerously-skip-permissions
+[ -n "$model" ] && set -- "$@" --model "$model"
+[ -n "$effort" ] && set -- "$@" --effort "$effort"
+set -- "$@" -i "$base_prompt"
 
-agy "${agy_args[@]}"
+agy "$@"
