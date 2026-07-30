@@ -1,0 +1,2 @@
+# The shebang breaks if this is checked out with CRLF line endings
+commit text eol=lf
