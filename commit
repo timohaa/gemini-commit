@@ -2,7 +2,15 @@
 
 # Smart git commit using the Antigravity CLI
 
-VERSION="2.0.0"
+VERSION="2.1.0"
+
+QUICK_MODEL="gemini-3.6-flash-low"
+DEEP_MODEL="gemini-3.1-pro-high"
+
+# Caps on how much repository context is inlined into the prompt
+MAX_SUBJECTS=20
+MAX_STATUS_LINES=100
+MAX_DIFFSTAT_LINES=100
 
 show_help() {
   cat <<'EOF'
@@ -12,7 +20,13 @@ Smart git commit using the Antigravity CLI.
 
 Options:
   -n, --no-yolo     Disable YOLO mode (ask for confirmation before executing actions)
+      --safe        Alias for --no-yolo
   -p, --push        Automatically push after successful commit(s)
+  -q, --quick       Use a fast, low-effort model (gemini-3.6-flash-low)
+  -d, --deep        Use a slower, high-effort model (gemini-3.1-pro-high)
+      --model NAME  Use a specific model (see 'agy models')
+      --effort STR  Reasoning effort: low, medium or high
+      --show-prompt Print the generated prompt and exit without running agy
   -h, --help        Show this help message
   -v, --version     Show version
   --                Treat everything after as custom instructions (even if it starts with -)
@@ -20,14 +34,32 @@ Options:
 Examples:
   commit
   commit "only index.js changes"
+  commit --quick
+  commit --deep "split the refactor and the bugfix into separate commits"
   commit --no-yolo
   commit -p "fix bug in parser"
 EOF
 }
 
+# Print at most <max> lines of <text>, noting how much was cut
+cap() {
+  local max=$1 text=$2
+  local -a lines
+  [[ -z "$text" ]] && return 0
+  lines=("${(@f)text}")
+  if (( ${#lines} > max )); then
+    print -rl -- "${(@)lines[1,max]}" "... (${#lines} lines total, truncated)"
+  else
+    print -r -- "$text"
+  fi
+}
+
 # 1. Parse options and arguments (before any git checks, so --help always works)
 yolo=true
 push_after=false
+show_prompt=false
+model=""
+effort=""
 args=()
 
 while [[ $# -gt 0 ]]; do
@@ -38,6 +70,53 @@ while [[ $# -gt 0 ]]; do
       ;;
     -p|--push)
       push_after=true
+      shift
+      ;;
+    -q|--quick)
+      model="$QUICK_MODEL"
+      shift
+      ;;
+    -d|--deep)
+      model="$DEEP_MODEL"
+      shift
+      ;;
+    --model)
+      if [[ -z "$2" ]]; then
+        echo "Error: --model requires a model name (see 'agy models')." >&2
+        exit 2
+      fi
+      model="$2"
+      shift 2
+      ;;
+    --model=*)
+      model="${1#--model=}"
+      if [[ -z "$model" ]]; then
+        echo "Error: --model requires a model name (see 'agy models')." >&2
+        exit 2
+      fi
+      shift
+      ;;
+    --effort|--effort=*)
+      if [[ "$1" == --effort=* ]]; then
+        effort="${1#--effort=}"
+        shift
+      elif [[ -n "$2" ]]; then
+        effort="$2"
+        shift 2
+      else
+        echo "Error: --effort requires a value: low, medium or high" >&2
+        exit 2
+      fi
+      case "$effort" in
+        low|medium|high) ;;
+        *)
+          echo "Error: --effort must be one of: low, medium, high" >&2
+          exit 2
+          ;;
+      esac
+      ;;
+    --show-prompt)
+      show_prompt=true
       shift
       ;;
     -h|--help)
@@ -65,8 +144,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-custom_instructions="${args[*]}"
-
 # 2. Check that the agy CLI is available
 if ! command -v agy >/dev/null 2>&1; then
   echo "Error: 'agy' command not found. Install the Antigravity CLI first." >&2
@@ -80,30 +157,96 @@ if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
 fi
 
 # 4. Check if there are any changes to commit (including untracked files)
-if [[ -z "$(git status --porcelain)" ]]; then
+git_status="$(git status --porcelain)"
+if [[ -z "$git_status" ]]; then
   echo "Nothing to commit (working tree clean)"
   exit 0
 fi
 
-# 5. Construct the prompt
-base_prompt="commit to git. this is an automatic prompt run from the command line. if there are lots of changes, feel free to split into separate commits. see previous commits for commit message style reference."
+# 5. Validate the model, if one was requested. A model that 'agy models' does not
+#    list is a warning rather than an error, so presets keep working across renames.
+if [[ -n "$model" ]]; then
+  available="$(agy models 2>/dev/null)"
+  if [[ -n "$available" ]] && ! grep -qx -- "$model" <<<"$available"; then
+    echo "Warning: model '$model' not listed by 'agy models'; using agy's default." >&2
+    model=""
+  fi
+fi
 
-if [[ -n "$custom_instructions" ]]; then
-  base_prompt="${base_prompt}
+# 6. Gather the repository context up front, so the agent does not have to
+branch="$(git branch --show-current 2>/dev/null)"
+if [[ -z "$branch" ]]; then
+  branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  [[ -z "$branch" || "$branch" == "HEAD" ]] && branch="(detached HEAD)"
+fi
+has_head="$(git rev-parse --verify -q HEAD 2>/dev/null)"
 
-User instructions for this commit:
-${custom_instructions}"
+context="Branch: ${branch}"
+
+if [[ -n "$has_head" ]]; then
+  context+=$'\n\n'"Recent commit subjects (match this style — mood, capitalization, prefix convention, length):"$'\n'
+  context+="$(cap $MAX_SUBJECTS "$(git log --pretty=%s -n $MAX_SUBJECTS)")"
+else
+  context+=$'\n\n'"This repository has no commits yet, so there is no existing style to match."
+fi
+
+context+=$'\n\n'"Changed files (git status --porcelain):"$'\n'
+context+="$(cap $MAX_STATUS_LINES "$git_status")"
+
+if [[ -n "$has_head" ]]; then
+  context+=$'\n\n'"Diffstat vs HEAD (untracked files are not included here):"$'\n'
+  context+="$(cap $MAX_DIFFSTAT_LINES "$(git diff --stat HEAD)")"
+fi
+
+# 7. Construct the prompt
+base_prompt=$(cat <<EOF
+You are running non-interactively from a \`commit\` shell wrapper, inside a git repository.
+
+## Repository context
+
+This was gathered for you already — do not re-run \`git log\`, \`git status\` or \`git diff --stat\`
+just to orient yourself.
+
+${context}
+
+## What to do
+
+1. Analyze the changes first. Read the actual diffs for the files above (\`git diff\`,
+   \`git diff --cached\`, or read untracked files directly) and work out what changed and why
+   before deciding anything.
+2. Group the changes into commits — one logical change per commit. If it is all one coherent
+   change, one commit is correct; do not split for the sake of splitting.
+3. Order the commits logically and chronologically: foundational and depended-upon changes
+   first, then what builds on them (a new helper before its callers, a config or ignore change
+   before the code that relies on it). The history should read in the order the work would
+   naturally have been done, and each commit should be self-consistent on its own.
+4. Write each message in the style of the recent subjects above.
+5. Stage per commit with explicit paths (\`git add <paths>\`) and commit. Do not \`git add -A\`
+   once and dump everything into a single commit unless that genuinely is the right grouping.
+EOF
+)
+
+if (( ${#args} > 0 )); then
+  base_prompt+=$'\n\n'"## User instructions for this commit"$'\n'
+  for arg in "${args[@]}"; do
+    base_prompt+="- ${arg}"$'\n'
+  done
 fi
 
 if [[ "$push_after" == "true" ]]; then
-  base_prompt="${base_prompt}
-
-Once the commit is (or commits are) successfully completed, push the committed branches to the remote repository (e.g. using 'git push')."
+  base_prompt+=$'\n\n'"Once the commit is (or commits are) successfully completed, push the committed branches to the remote repository (e.g. using 'git push')."
 fi
 
-# 6. Run Antigravity
+if [[ "$show_prompt" == "true" ]]; then
+  print -r -- "$base_prompt"
+  exit 0
+fi
+
+# 8. Run Antigravity
 agy_args=()
 [[ "$yolo" == "true" ]] && agy_args+=(--dangerously-skip-permissions)
+[[ -n "$model" ]] && agy_args+=(--model "$model")
+[[ -n "$effort" ]] && agy_args+=(--effort "$effort")
 agy_args+=(-i "$base_prompt")
 
 agy "${agy_args[@]}"
