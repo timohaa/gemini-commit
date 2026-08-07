@@ -16,17 +16,20 @@ if [ -n "${ZSH_VERSION:-}" ]; then
   emulate sh
 fi
 
-VERSION="2.3.0"
+VERSION="2.4.0"
 
-# --quick and --deep resolve against 'agy models' at runtime rather than naming a
-# model literally, so they keep pointing at something sensible as models come and
-# go. Patterns are tried in order of preference; within one pattern the first
-# match wins, since 'agy models' lists newest first. These fallbacks are only
-# used when 'agy models' cannot be read.
+# --quick, --deep and the balanced default (used when no model option is given)
+# resolve against 'agy models' at runtime rather than naming a model literally,
+# so they keep pointing at something sensible as models come and go. Patterns
+# are tried in order of preference; within one pattern the first match wins,
+# since 'agy models' lists newest first. These fallbacks are only used when
+# 'agy models' cannot be read.
 QUICK_PATTERNS='*flash*-low *-low *flash* *'
 DEEP_PATTERNS='*pro*-high *pro* *-high *'
+BALANCED_PATTERNS='*flash*-medium *-medium *flash* *'
 QUICK_FALLBACK="gemini-3.6-flash-low"
 DEEP_FALLBACK="gemini-3.1-pro-high"
+BALANCED_FALLBACK="gemini-3.6-flash-medium"
 
 # Caps on how much repository context is inlined into the prompt
 MAX_SUBJECTS=20
@@ -62,6 +65,9 @@ Options:
   -h, --help        Show this help message
   -v, --version     Show version
   --                Treat everything after as custom instructions (even if it starts with -)
+
+Without -q, -d or --model, a balanced model is picked from 'agy models'
+(the newest flash model at medium effort).
 
 Examples:
   commit
@@ -426,13 +432,15 @@ if [ -z "$git_status" ]; then
   fi
 fi
 
-# 8. Resolve the model. --quick/--deep are picked from 'agy models'; an explicit
-#    --model is validated against the same list. A model that is not listed is a
-#    warning rather than an error, so a run never fails just over model naming.
-models=""
-if [ -n "$model" ] || [ -n "$model_role" ]; then
-  models="$(agy models 2>/dev/null)"
-fi
+# 8. Resolve the model. --quick/--deep are picked from 'agy models'; without any
+#    model option a balanced middle-of-the-road model is picked the same way, so
+#    a bare run never depends on whatever agy happens to be configured with. An
+#    explicit --model is validated against the same list. A model that is not
+#    listed is a warning rather than an error, so a run never fails just over
+#    model naming. 'agy models' lines are 'id<TAB>display name'; only the ids
+#    are wanted, both as pick_model candidates and for the exact-line match below.
+[ -n "$model" ] || [ -n "$model_role" ] || model_role="balanced"
+models="$(agy models 2>/dev/null | cut -f1)"
 
 case "$model_role" in
   quick)
@@ -440,6 +448,9 @@ case "$model_role" in
     ;;
   deep)
     model="$(pick_model "$DEEP_PATTERNS")" || model="$DEEP_FALLBACK"
+    ;;
+  balanced)
+    model="$(pick_model "$BALANCED_PATTERNS")" || model="$BALANCED_FALLBACK"
     ;;
 esac
 

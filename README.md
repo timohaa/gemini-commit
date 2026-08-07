@@ -40,6 +40,9 @@ Options:
   -h, --help        Show this help message
   -v, --version     Show version
   --                Treat everything after as custom instructions (even if it starts with -)
+
+Without -q, -d or --model, a balanced model is picked from 'agy models'
+(the newest flash model at medium effort).
 ```
 
 ### Examples
@@ -130,21 +133,22 @@ it stands and commits nothing.
 
 ## Model selection
 
-By default no model flag is passed to Antigravity, letting it use whatever model you've configured as default. Two presets cover the cases where you want to lean one way:
+By default a balanced middle-of-the-road model is selected, so a bare `commit` never depends on whatever model Antigravity happens to be configured with. Two presets cover the cases where you want to lean one way:
 
 ```sh
 commit --quick    # small, obvious changesets
 commit --deep     # large or subtle refactors
 ```
 
-Neither preset names a model literally. Both read `agy models` at runtime and pick the first entry matching a short list of patterns, in order of preference:
+None of the three names a model literally. Each reads `agy models` at runtime and picks the first entry matching a short list of patterns, in order of preference:
 
-| Preset    | Patterns tried                                  |
-|-----------|-------------------------------------------------|
-| `--quick` | `*flash*-low`, `*-low`, `*flash*`, first listed |
-| `--deep`  | `*pro*-high`, `*pro*`, `*-high`, first listed   |
+| Preset    | Patterns tried                                        |
+|-----------|-------------------------------------------------------|
+| (default) | `*flash*-medium`, `*-medium`, `*flash*`, first listed |
+| `--quick` | `*flash*-low`, `*-low`, `*flash*`, first listed       |
+| `--deep`  | `*pro*-high`, `*pro*`, `*-high`, first listed         |
 
-`agy models` lists newest first, so the first match is also the most recent model of that kind — as of writing, `gemini-3.6-flash-low` and `gemini-3.1-pro-high`. When Google ships a new generation the presets follow it with no edit here. If `agy models` can't be read at all (offline, older CLI), the presets fall back to those two names.
+`agy models` lists newest first, so the first match is also the most recent model of that kind — as of writing, `gemini-3.6-flash-medium`, `gemini-3.6-flash-low` and `gemini-3.1-pro-high`. When Google ships a new generation the presets follow it with no edit here. If `agy models` can't be read at all (offline, older CLI), the presets fall back to those three names.
 
 Anything else is reachable directly, and the last model flag on the command line wins:
 
@@ -175,6 +179,7 @@ Antigravity is launched in interactive mode (`agy -i`), so you keep the session 
 
 Releases follow [semantic versioning](https://semver.org) and are tagged on GitHub (`v<major>.<minor>.<patch>`), newest first:
 
+- v2.4.0 — a balanced model (the newest flash at medium effort) is now selected when no model option is given, instead of leaving the choice to Antigravity's own configuration; it also fixes model resolution against the tab-separated `agy models` output, which previously made `--quick`, `--deep` and valid `--model` selections be discarded with a spurious "not listed" warning.
 - v2.3.0 — added `--amend`, which refuses any commit already reachable from a remote, and `--tag` for cutting annotated release tags; it also fixes `--quick`/`--deep` model resolution when `zsh` is used as the interpreter directly (`zsh commit`), where zsh's native splitting and pattern-matching rules made both presets fall back to their hard-coded default.
 - v2.2.0 — rewrote the script in POSIX `sh` (dropping the `zsh` requirement), made `--quick` and `--deep` resolve against `agy models` instead of hard-coded model names, and added recent commit messages in full to the prompt so body and trailer conventions are visible alongside subject style; it also joins unquoted instruction words into a single instruction, rejects bare repositories and `.git` directories properly, and lets `--show-prompt` run without the Antigravity CLI installed.
 - v2.1.0 — added model selection and precomputed repository context in the prompt.
