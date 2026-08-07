@@ -4,7 +4,19 @@
 #
 # Written in POSIX sh so it runs under sh, bash, zsh, dash, ash and ksh alike.
 
-VERSION="2.2.0"
+# zsh only behaves like a POSIX sh once it recognizes it is running as one
+# (e.g. invoked through a '#!/bin/sh' shebang, where it checks argv[0]).
+# Invoked directly as 'zsh commit', it keeps its native rules instead: unquoted
+# parameter expansions are not IFS-split, and a variable used as a case pattern
+# matches literally rather than as a glob unless GLOB_SUBST is on. Both trip up
+# pick_model()'s word lists and glob matching below. 'emulate sh' switches zsh
+# into sh-compatible behavior for the rest of this script. Outside zsh the whole
+# block is inert, since $ZSH_VERSION is unset there.
+if [ -n "${ZSH_VERSION:-}" ]; then
+  emulate sh
+fi
+
+VERSION="2.3.0"
 
 # --quick and --deep resolve against 'agy models' at runtime rather than naming a
 # model literally, so they keep pointing at something sensible as models come and
@@ -22,6 +34,8 @@ MAX_FULL_MESSAGES=5      # commits shown in full, bodies included
 MAX_FULL_LOG_LINES=80    # safety valve for repos with very long bodies
 MAX_STATUS_LINES=100
 MAX_DIFFSTAT_LINES=100
+MAX_TAGS=10              # existing tags shown as naming context for --tag
+MAX_TAG_SUBJECTS=40      # subjects since the last tag, material for the tag message
 
 # A literal newline, since POSIX sh has no $'\n'
 NL='
@@ -38,6 +52,8 @@ Options:
   -n, --no-yolo     Disable YOLO mode (ask for confirmation before executing actions)
       --safe        Alias for --no-yolo
   -p, --push        Automatically push after successful commit(s)
+      --amend       Amend the last commit instead of adding one (unpushed only)
+      --tag NAME    Tag the result: a tag name, or major, minor or patch
   -q, --quick       Use the fastest low-effort model listed by 'agy models'
   -d, --deep        Use the strongest high-effort model listed by 'agy models'
       --model NAME  Use a specific model (see 'agy models')
@@ -54,6 +70,8 @@ Examples:
   commit --deep "split the refactor and the bugfix into separate commits"
   commit --no-yolo
   commit -p "fix bug in parser"
+  commit --amend
+  commit --tag minor -p
 EOF
 }
 
@@ -97,10 +115,48 @@ pick_model() {
   printf '%s\n' "$pick_result"
 }
 
+# Bump one component of <tag>, keeping whatever prefix it uses: bump_tag v2.2.0 minor
+# prints v2.3.0, bump_tag release-1.4.7 patch prints release-1.4.8. Returns 1 unless
+# the name is <prefix><major>.<minor>.<patch> with plain decimal components, so
+# pre-release and date-style tags are refused rather than mangled — and so a leading
+# zero never reaches $(( )), which would read it as octal.
+# Uses bump_-prefixed globals rather than 'local', which is not POSIX.
+bump_tag() {
+  bump_base=$1
+  bump_level=$2
+  bump_prefix="${bump_base%%[0-9]*}"
+  bump_nums="${bump_base#"$bump_prefix"}"
+  case "$bump_nums" in
+    *.*.*) ;;
+    *) return 1 ;;
+  esac
+  bump_major="${bump_nums%%.*}"
+  bump_rest="${bump_nums#*.}"
+  bump_minor="${bump_rest%%.*}"
+  bump_patch="${bump_rest#*.}"
+  for bump_n in "$bump_major" "$bump_minor" "$bump_patch"; do
+    case "$bump_n" in
+      ''|*[!0-9]*|0[0-9]*) return 1 ;;
+    esac
+  done
+  case "$bump_level" in
+    major) bump_major=$((bump_major + 1)); bump_minor=0; bump_patch=0 ;;
+    minor) bump_minor=$((bump_minor + 1)); bump_patch=0 ;;
+    patch) bump_patch=$((bump_patch + 1)) ;;
+    *) return 1 ;;
+  esac
+  printf '%s%s.%s.%s\n' "$bump_prefix" "$bump_major" "$bump_minor" "$bump_patch"
+}
+
 # 1. Parse options and arguments (before any git checks, so --help always works)
 yolo=true
 push_after=false
 show_prompt=false
+amend=false
+amend_reword_only=false
+tag_level=""
+tag_name=""
+tag_only=false
 model=""
 model_role=""
 effort=""
@@ -115,6 +171,43 @@ while [ $# -gt 0 ]; do
     -p|--push)
       push_after=true
       shift
+      ;;
+    --amend)
+      amend=true
+      shift
+      ;;
+    --tag|--tag=*)
+      # The value is mandatory even though bare 'major|minor|patch' would be a
+      # plausible default: bare words are custom instructions, so an optional
+      # argument would read 'commit --tag "also bump the readme"' as a tag name.
+      case "$1" in
+        --tag=*)
+          tag_arg="${1#--tag=}"
+          shift
+          ;;
+        *)
+          tag_arg="${2-}"
+          if [ -n "$tag_arg" ]; then
+            shift 2
+          else
+            shift
+          fi
+          ;;
+      esac
+      if [ -z "$tag_arg" ]; then
+        printf '%s\n' "Error: --tag requires a tag name, or one of: major, minor, patch" >&2
+        exit 2
+      fi
+      case "$tag_arg" in
+        major|minor|patch)
+          tag_level="$tag_arg"
+          tag_name=""
+          ;;
+        *)
+          tag_level=""
+          tag_name="$tag_arg"
+          ;;
+      esac
       ;;
     -q|--quick)
       model=""
@@ -217,14 +310,123 @@ if [ "$(git rev-parse --is-inside-work-tree 2>/dev/null)" != "true" ]; then
   exit 1
 fi
 
-# 4. Check if there are any changes to commit (including untracked files)
-git_status="$(git status --porcelain)"
-if [ -z "$git_status" ]; then
-  printf '%s\n' "Nothing to commit (working tree clean)"
-  exit 0
+# 4. Resolve HEAD once: --amend, --tag and the context section all need to know
+#    whether the repository has any commits yet.
+has_head="$(git rev-parse --verify -q HEAD 2>/dev/null)"
+
+# 5. Validate --amend. Amending is only offered while the commit is still private, so
+#    this refuses as soon as HEAD is reachable from anything on a remote. Every check
+#    reads local refs only — nothing is fetched — so remote-tracking refs are only as
+#    fresh as the last fetch or push; that is the one hole, and it is why a positive
+#    result refuses outright instead of rewriting and hoping.
+amend_is_merge=""
+amend_head_tags=""
+if [ "$amend" = "true" ]; then
+  if [ -z "$has_head" ]; then
+    printf '%s\n' "Error: --amend needs an existing commit, but this repository has no commits yet." >&2
+    exit 1
+  fi
+
+  # A merge, cherry-pick or revert in progress would be folded into the amend silently.
+  for amend_state in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD; do
+    if [ -f "$(git rev-parse --git-path "$amend_state")" ]; then
+      printf '%s\n' "Error: --amend is unsafe while $amend_state exists (a merge, cherry-pick or revert is in progress)." >&2
+      printf '%s\n' "Finish or abort it first, then run commit again." >&2
+      exit 1
+    fi
+  done
+
+  # Two pushed checks, because neither subsumes the other: an upstream can be a local
+  # branch, which no remote-tracking ref would show, while a push made under another
+  # branch name or to a second remote never touches this branch's upstream.
+  amend_upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)"
+  if [ -n "$amend_upstream" ] && git merge-base --is-ancestor HEAD "$amend_upstream" 2>/dev/null; then
+    printf '%s\n' "Error: HEAD is already on $amend_upstream, so --amend would rewrite pushed history." >&2
+    printf '%s\n' "Run 'commit' without --amend to add a new commit on top instead." >&2
+    exit 1
+  fi
+
+  # The ' -> ' filter drops the symbolic origin/HEAD line, which is not a real branch.
+  amend_remote_refs="$(git branch -r --contains HEAD 2>/dev/null | grep -v ' -> ' | sed 's/^[[:space:]]*//' | tr '\n' ' ')"
+  amend_remote_refs="${amend_remote_refs% }"
+  if [ -n "$amend_remote_refs" ]; then
+    printf '%s\n' "Error: HEAD is already present on $amend_remote_refs, so --amend would rewrite pushed history." >&2
+    printf '%s\n' "Run 'commit' without --amend to add a new commit on top instead." >&2
+    exit 1
+  fi
+
+  if [ -z "$amend_upstream" ]; then
+    printf '%s\n' "Warning: the branch has no upstream, so 'not pushed yet' was only checked against remote-tracking refs." >&2
+  fi
+
+  # HEAD^2 resolves only for a merge commit; --min-parents would find the newest merge
+  # anywhere in history instead of testing HEAD itself.
+  if git rev-parse -q --verify 'HEAD^2' >/dev/null 2>&1; then
+    amend_is_merge=true
+    printf '%s\n' "Warning: HEAD is a merge commit; amending it keeps both parents." >&2
+  fi
+
+  amend_head_tags="$(git tag --points-at HEAD | tr '\n' ' ')"
+  amend_head_tags="${amend_head_tags% }"
+  if [ -n "$amend_head_tags" ]; then
+    printf '%s\n' "Warning: tag(s) $amend_head_tags point at HEAD; amending leaves them on the pre-amend commit." >&2
+  fi
 fi
 
-# 5. Resolve the model. --quick/--deep are picked from 'agy models'; an explicit
+# 6. Resolve --tag to a concrete name, so a bad name, an unbumpable base or a
+#    collision fails here rather than halfway through an agy session, and so
+#    --show-prompt shows the name that will actually be used.
+tag_base=""
+if [ -n "$tag_level" ] || [ -n "$tag_name" ]; then
+  # The nearest tag reachable from HEAD, rather than the highest tag in the repository:
+  # on a release branch the latter can belong to an entirely different line of work.
+  tag_base="$(git describe --tags --abbrev=0 2>/dev/null)"
+
+  if [ -n "$tag_level" ]; then
+    if [ -z "$tag_base" ]; then
+      printf '%s\n' "Error: --tag $tag_level needs an existing tag to bump from, and this repository has none." >&2
+      printf '%s\n' "Pass an explicit name instead, e.g. 'commit --tag v0.1.0'." >&2
+      exit 2
+    fi
+    if ! tag_name="$(bump_tag "$tag_base" "$tag_level")"; then
+      printf '%s\n' "Error: cannot bump '$tag_base': it is not <prefix><major>.<minor>.<patch>." >&2
+      printf '%s\n' "Pass an explicit name instead." >&2
+      exit 2
+    fi
+  fi
+
+  if ! git check-ref-format "refs/tags/$tag_name" 2>/dev/null; then
+    printf '%s\n' "Error: '$tag_name' is not a valid git tag name." >&2
+    exit 2
+  fi
+  if git rev-parse -q --verify "refs/tags/$tag_name" >/dev/null 2>&1; then
+    printf '%s\n' "Error: tag '$tag_name' already exists." >&2
+    exit 1
+  fi
+fi
+
+# 7. Check if there is anything to do. A clean tree is normally a no-op, but --amend
+#    can still reword the last commit and --tag can still tag HEAD, so those keep
+#    going. Both notices go to stderr, so --show-prompt output stays pipeable.
+git_status="$(git status --porcelain)"
+if [ -z "$git_status" ]; then
+  if [ "$amend" = "true" ]; then
+    amend_reword_only=true
+    printf '%s\n' "Working tree clean: --amend will reword the last commit message only." >&2
+  elif [ -n "$tag_name" ]; then
+    if [ -z "$has_head" ]; then
+      printf '%s\n' "Error: --tag needs a commit to tag, but this repository has no commits and nothing to commit." >&2
+      exit 1
+    fi
+    tag_only=true
+    printf '%s\n' "Working tree clean: nothing to commit, tagging HEAD only." >&2
+  else
+    printf '%s\n' "Nothing to commit (working tree clean)"
+    exit 0
+  fi
+fi
+
+# 8. Resolve the model. --quick/--deep are picked from 'agy models'; an explicit
 #    --model is validated against the same list. A model that is not listed is a
 #    warning rather than an error, so a run never fails just over model naming.
 models=""
@@ -254,7 +456,7 @@ if [ -n "$model" ] && [ -n "$models" ]; then
   esac
 fi
 
-# 6. Gather the repository context up front, so the agent does not have to
+# 9. Gather the repository context up front, so the agent does not have to
 #    re-derive it (branch, log, status, diffstat) itself on every run.
 branch="$(git branch --show-current 2>/dev/null)"
 if [ -z "$branch" ]; then
@@ -263,7 +465,6 @@ if [ -z "$branch" ]; then
     branch="(detached HEAD)"
   fi
 fi
-has_head="$(git rev-parse --verify -q HEAD 2>/dev/null)"
 
 context="Branch: ${branch}"
 
@@ -281,27 +482,115 @@ else
   context="${context}${NL}${NL}This repository has no commits yet, so there is no existing style to match."
 fi
 
-context="${context}${NL}${NL}Changed files (git status --porcelain):${NL}"
-context="${context}$(cap "$MAX_STATUS_LINES" "$git_status")"
-
-if [ -n "$has_head" ]; then
-  context="${context}${NL}${NL}Diffstat vs HEAD (untracked files are not included here):${NL}"
-  context="${context}$(cap "$MAX_DIFFSTAT_LINES" "$(git diff --stat HEAD)")"
+# A clean tree only gets this far with --amend or --tag, and then both of these blocks
+# would be a heading over nothing, which reads as context that failed to load.
+if [ -n "$git_status" ]; then
+  context="${context}${NL}${NL}Changed files (git status --porcelain):${NL}"
+  context="${context}$(cap "$MAX_STATUS_LINES" "$git_status")"
+else
+  context="${context}${NL}${NL}The working tree is clean: nothing is modified, staged or untracked."
 fi
 
-# 7. Construct the prompt
-base_prompt=$(cat <<EOF
-You are running non-interactively from a \`commit\` shell wrapper, inside a git repository.
+# Empty on a clean tree, and also when every change is an untracked file.
+diffstat=""
+[ -n "$has_head" ] && diffstat="$(git diff --stat HEAD)"
+if [ -n "$diffstat" ]; then
+  if [ "$amend" = "true" ]; then
+    context="${context}${NL}${NL}Diffstat vs HEAD — the changes to fold into the amended commit (untracked files are not included here):${NL}"
+  else
+    context="${context}${NL}${NL}Diffstat vs HEAD (untracked files are not included here):${NL}"
+  fi
+  context="${context}$(cap "$MAX_DIFFSTAT_LINES" "$diffstat")"
+fi
 
-## Repository context
+if [ "$amend" = "true" ]; then
+  # HEAD's message is repeated verbatim here, trailers and all, even though the sample
+  # above already shows a stripped copy of it: this is the message being rewritten, and
+  # a stripped view would quietly drop a co-author who genuinely worked on the commit.
+  context="${context}${NL}${NL}The commit to amend is HEAD ($(git rev-parse --short HEAD)), the newest entry above. Its message verbatim, trailers included — this is what you are starting from, while the style to match comes from the older entries:${NL}"
+  context="${context}$(git log -n1 --pretty='format:%B' HEAD)"
+  # Empty for a merge commit, where git show reports no diff of its own.
+  amend_head_stat="$(git show --stat --format= HEAD)"
+  if [ -n "$amend_head_stat" ]; then
+    if [ "$amend_reword_only" = "true" ]; then
+      context="${context}${NL}${NL}Files in that commit (git show --stat HEAD) — the message has to describe these:${NL}"
+    else
+      context="${context}${NL}${NL}Files already in that commit (git show --stat HEAD). The amended commit ends up containing these plus the working-tree changes above:${NL}"
+    fi
+    context="${context}$(cap "$MAX_DIFFSTAT_LINES" "$amend_head_stat")"
+  fi
+  if [ -n "$amend_is_merge" ]; then
+    context="${context}${NL}${NL}HEAD is a merge commit: keep both parents, do not flatten it and do not rebase."
+  fi
+  if [ -n "$amend_head_tags" ]; then
+    context="${context}${NL}${NL}Tags currently pointing at HEAD: ${amend_head_tags}. Amending leaves them on the pre-amend commit."
+  fi
+fi
 
-This was gathered for you already — do not re-run \`git log\`, \`git status\` or \`git diff --stat\`
-just to orient yourself.
+if [ -n "$tag_name" ]; then
+  tag_list="$(git tag --sort=-v:refname 2>/dev/null)"
+  if [ -n "$tag_list" ]; then
+    context="${context}${NL}${NL}Existing tags, highest version first:${NL}"
+    context="${context}$(cap "$MAX_TAGS" "$tag_list")"
+  else
+    context="${context}${NL}${NL}This repository has no tags yet."
+  fi
+  # Empty when HEAD is already tagged and nothing has been committed since, in which case
+  # the header alone would be a promise of context that never arrives.
+  tag_log=""
+  [ -n "$tag_base" ] && tag_log="$(git log --pretty=%s "${tag_base}..HEAD")"
+  if [ -n "$tag_log" ]; then
+    context="${context}${NL}${NL}Commit subjects since ${tag_base}, the most recent tag reachable from HEAD — raw material for the tag message:${NL}"
+    context="${context}$(cap "$MAX_TAG_SUBJECTS" "$tag_log")"
+  fi
+fi
 
-${context}
-
-## What to do
-
+# 10. Construct the prompt. The instructions are selected rather than appended to:
+#     --amend contradicts "group the changes into commits", so leaving that step in
+#     place and overriding it further down would read as a conflict.
+#
+#     Keep apostrophes out of these heredocs. Inside $( ), the shell tracks quotes
+#     through the heredoc body as well, so a lone ' is read as opening a quoted string
+#     and the command substitution never finds its closing paren.
+if [ "$amend_reword_only" = "true" ]; then
+  steps=$(cat <<EOF
+1. The working tree is clean, so there is nothing to fold in: this is a message-only reword of
+   the newest commit. Run \`git commit --amend\` with a corrected message and change nothing
+   else — no staging, no new commit, no rebase, no force-push.
+2. Start from the current message of HEAD above and keep its trailers unless they genuinely
+   no longer apply. Match the style of the older commits. Never describe the reword itself.
+EOF
+)
+elif [ "$amend" = "true" ]; then
+  steps=$(cat <<EOF
+1. Analyze first. Read the working-tree diffs for the files above (\`git diff\`,
+   \`git diff --cached\`, or read untracked files directly) and read the commit you are
+   amending (\`git show HEAD\`), so you know what it already contains.
+2. Fold those working-tree changes into the existing HEAD commit. This run produces exactly
+   one commit — the amended HEAD — so do not create a new commit and do not split anything
+   out. Stage with explicit paths (\`git add <paths>\`, including any untracked files that
+   belong in the commit), then \`git commit --amend\`.
+3. Judge the message against the combined change: what HEAD already had, plus what you just
+   folded in. If the existing message still describes it, keep it exactly
+   (\`git commit --amend --no-edit\`). If it no longer fits, or it was a placeholder like
+   "wip" or "fixup", rewrite it starting from the HEAD message above, matching the style of
+   the older commits. Keep the existing trailers unless they genuinely no longer apply. Never
+   describe the amendment itself.
+4. Touch nothing but HEAD: no rebase, reset, cherry-pick or revert, and never push with
+   \`--force\` or \`--force-with-lease\`. The wrapper has already verified that HEAD is not
+   present on any remote, so an ordinary push is always enough.
+5. If some of the working-tree changes do not belong in this commit, leave them unstaged and
+   say so at the end rather than folding them in.
+EOF
+)
+elif [ "$tag_only" = "true" ]; then
+  steps=$(cat <<EOF
+1. The working tree is clean, so there is nothing to commit. Do not create or amend a commit
+   and do not stage anything. Your only job is the tag described below, on the current HEAD.
+EOF
+)
+else
+  steps=$(cat <<EOF
 1. Analyze the changes first. Read the actual diffs for the files above (\`git diff\`,
    \`git diff --cached\`, or read untracked files directly) and work out what changed and why
    before deciding anything.
@@ -320,13 +609,49 @@ ${context}
    once and dump everything into a single commit unless that genuinely is the right grouping.
 EOF
 )
+fi
+
+base_prompt=$(cat <<EOF
+You are running non-interactively from a \`commit\` shell wrapper, inside a git repository.
+
+## Repository context
+
+This was gathered for you already — do not re-run \`git log\`, \`git status\` or \`git diff --stat\`
+just to orient yourself.
+
+${context}
+
+## What to do
+
+${steps}
+EOF
+)
 
 if [ -n "$args" ]; then
   base_prompt="${base_prompt}${NL}${NL}## User instructions for this commit${NL}${args}"
 fi
 
+if [ -n "$tag_name" ]; then
+  base_prompt="${base_prompt}${NL}${NL}## Tagging${NL}"
+  base_prompt="${base_prompt}${NL}Then tag the result. This is a release tag, so the message matters as much as the name."
+  base_prompt="${base_prompt}${NL}- Name it exactly '${tag_name}'. It does not exist yet — the wrapper checked — so do not pick a different name and do not add or drop a prefix."
+  base_prompt="${base_prompt}${NL}- Tag the commit this run produces, never an earlier one."
+  base_prompt="${base_prompt}${NL}- Make it an annotated tag, never a lightweight one: 'git tag -a ${tag_name} -m <subject> [-m <body>]'."
+  base_prompt="${base_prompt}${NL}- Write the tag message from the commits the release contains (the subjects above, plus whatever you commit now), in the tone the repository uses for commit bodies. Do not paste a raw 'git log' dump."
+  base_prompt="${base_prompt}${NL}- Do not edit version strings in the source tree. If the repository tracks its version in a file and the changes do not already update it, say so at the end instead."
+  base_prompt="${base_prompt}${NL}- Do not create the tag at all if the commit step failed."
+  if [ "$push_after" != "true" ]; then
+    base_prompt="${base_prompt}${NL}- Do not push the tag; this run creates it locally only."
+  fi
+fi
+
 if [ "$push_after" = "true" ]; then
   base_prompt="${base_prompt}${NL}${NL}Once the commit is (or commits are) successfully completed, push the committed branches to the remote repository (e.g. using 'git push')."
+  if [ -n "$tag_name" ]; then
+    # A plain 'git push' leaves the tag behind, and 'git push --tags' would publish every
+    # local tag, including ones the user never meant to share.
+    base_prompt="${base_prompt} Push the tag as well, by name: 'git push origin ${tag_name}'. Do not use 'git push --tags', and never force-push."
+  fi
 fi
 
 if [ "$show_prompt" = "true" ]; then
@@ -334,9 +659,9 @@ if [ "$show_prompt" = "true" ]; then
   exit 0
 fi
 
-# 8. Run Antigravity. Rebuild the positional parameters as agy's argument list;
-#    the leading 'set --' is required because '--' above breaks out of the loop
-#    without consuming the remaining arguments.
+# 11. Run Antigravity. Rebuild the positional parameters as agy's argument list;
+#     the leading 'set --' is required because '--' above breaks out of the loop
+#     without consuming the remaining arguments.
 set --
 [ "$yolo" = "true" ] && set -- "$@" --dangerously-skip-permissions
 [ -n "$model" ] && set -- "$@" --model "$model"
