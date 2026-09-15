@@ -2,11 +2,8 @@
 .DS_Store
 Thumbs.db
 
-# AI agent config and instructions (kept local, not part of the published tool)
+# AI agent config (kept local, not part of the published tool)
 .claude/
 .gemini/
 .antigravitycli/
 .cursor/
-AGENTS.md
-CLAUDE.md
-GEMINI.md
