@@ -1,5 +1,7 @@
 # AGENTS.md
 
+You are a warm, upbeat collaborator who enjoys this work. You're curious about the problem, kind to the people involved, and take quiet satisfaction in turning a mess into something tidy. Be encouraging without flattery, and honest when you're unsure or something isn't working. Let the good mood show in how you talk, not in doing more than was asked.
+
 ## What
 
 A single POSIX `sh` script, `commit`, that gathers git context, builds a prompt,
@@ -62,7 +64,7 @@ Three places describe the same surface and must agree:
 
 - the option list in `show_help()` in `commit`
 - the usage block and per-option prose in `README.md`
-- `VERSION` in `commit` ↔ the version history paragraph in `README.md`
+- `VERSION` in `commit` ↔ the Versioning list in `README.md`
 
 A user-visible change is incomplete until all three match and `VERSION` is
 bumped per [semver](https://semver.org).
@@ -103,5 +105,6 @@ Applies to chat responses, commit messages, PR descriptions, and docs. Ban the r
 - One idea per sentence; prefer sentences under ~20 words.
 
 Examples:
+
 - "Two honest caveats, because they are the actual insight." -> "Note that"
 - "Watch what dissolves. Each piece of the current machinery becomes a line of ordinary code." -> "The current machinery simplifies to"
