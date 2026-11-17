@@ -71,8 +71,6 @@ bumped per [semver](https://semver.org).
 
 ## Behavior
 
-- **Think before coding.** If a request is ambiguous, sketch a short plan and
-  surface assumptions before editing.
 - **Minimum footprint.** No speculative options, no drive-by rewrites, no
   unrelated cleanup bundled into the same change.
 - **Verify, don't trust.** Lint passing is not evidence the script works. Run it
@@ -84,10 +82,6 @@ bumped per [semver](https://semver.org).
 - [README.md](./README.md) — user-facing docs; the "How it works" section is the
   design rationale for the prompt
 - `.claude/skills/add-option` — end-to-end workflow for adding a CLI flag
-- `/polish`, `/review-changes`, `/check-quality`, `/verify-script` — quality
-  slash commands (see `.claude/skills/`)
-- `.claude/agents/` — specialized agents for script lint + portability
-  verification, comment quality, docs/script sync, and `AGENTS.md` enforcement
 
 ## Writing Style
 
